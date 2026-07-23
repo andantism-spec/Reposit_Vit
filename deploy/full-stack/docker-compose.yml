@@ -1,0 +1,60 @@
+# 전체 스택 한 번에 띄우기: 원격제어 서버 + cloudflared(공개 URL) + coturn(선택)
+#
+# ⚠️ 이 compose는 "제어 대상 PC가 리눅스 X11 데스크톱"일 때를 전제로 합니다.
+#    컨테이너가 호스트의 화면(X11 소켓)과 입력에 접근해야 하므로 network_mode: host와
+#    X11 소켓 마운트를 사용합니다. Wayland/ macOS / Windows 호스트에서는 동작하지 않습니다
+#    (그 경우 server.py를 호스트에서 직접 실행하세요).
+#
+# 사용법:
+#   cd deploy/full-stack
+#   cp .env.example .env      # REMOTE_TOKEN 등 값 채우기
+#   xhost +local:             # 컨테이너가 X 서버에 접근하도록 허용 (호스트에서 1회)
+#   docker compose up -d --build
+#   docker compose logs -f cloudflared   # 출력된 https://xxxx.trycloudflare.com 로 접속
+#
+# coturn까지 함께 띄우려면:  docker compose --profile turn up -d --build
+
+services:
+  # 1) 원격제어 서버 (화면 스트리밍 + 입력)
+  remote:
+    build:
+      context: ../..
+      dockerfile: deploy/full-stack/Dockerfile
+    container_name: remote-control
+    network_mode: host          # WebRTC/ICE 및 호스트 X11 접근에 유리
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+      - REMOTE_TOKEN=${REMOTE_TOKEN:?REMOTE_TOKEN을 .env에 설정하세요}
+      # TURN을 쓸 경우 아래 값이 그대로 브라우저에도 전달됩니다.
+      - TURN_URL=${TURN_URL:-}
+      - TURN_USER=${TURN_USER:-}
+      - TURN_PASS=${TURN_PASS:-}
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+      - ${XAUTHORITY:-${HOME}/.Xauthority}:/root/.Xauthority:ro
+    command: ["--host", "0.0.0.0", "--port", "8000", "--max-width", "1600"]
+    restart: unless-stopped
+
+  # 2) cloudflared 퀵 터널 — 시그널링 포트를 공개 HTTPS URL로 노출
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: remote-cloudflared
+    network_mode: host
+    command: tunnel --url http://localhost:8000
+    depends_on:
+      - remote
+    restart: unless-stopped
+
+  # 3) coturn TURN 릴레이 (선택) — `--profile turn`으로만 기동
+  #    ⚠️ TURN은 공인 IP가 있어야 릴레이가 동작합니다. 제어 대상 PC가 NAT 뒤에 있으면
+  #       이 서비스는 별도의 공인 IP 서버(VPS)에 두는 것이 맞습니다. 여기서는 호스트가
+  #       공인 IP를 가진 경우를 위한 편의 구성입니다. (설정은 ../coturn/turnserver.conf 재사용)
+  coturn:
+    image: coturn/coturn:4.6
+    container_name: remote-coturn
+    network_mode: host
+    profiles: ["turn"]
+    volumes:
+      - ../coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+    restart: unless-stopped

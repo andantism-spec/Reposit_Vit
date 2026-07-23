@@ -67,6 +67,9 @@ ngrok http 8000
 
 터널이 HTTPS를 제공하면 브라우저의 보안 컨텍스트 문제도 함께 해결됩니다(WebRTC 권장).
 
+> **한 번에 띄우기**: 원격제어 서버 + cloudflared + coturn을 함께 올리는 Docker Compose 예시는
+> [`deploy/full-stack/`](deploy/full-stack/)에 있습니다 (리눅스 X11 데스크톱 전제).
+
 ### 직접 연결이 안 될 때 (TURN)
 
 양쪽이 까다로운 NAT(대칭형) 뒤에 있으면 STUN만으로는 P2P가 안 되어 **TURN 릴레이**가 필요합니다.
