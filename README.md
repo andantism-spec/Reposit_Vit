@@ -81,6 +81,9 @@ python server.py \
 
 환경변수 `TURN_URL`, `TURN_USER`, `TURN_PASS`로도 지정할 수 있습니다.
 
+TURN 서버를 직접 운영하려면 **[coturn 셋업 가이드](docs/coturn-setup.md)**를 참고하세요
+(설치·설정·인증·TLS·검증까지 정리되어 있습니다).
+
 ## 옵션
 
 | 옵션 | 기본값 | 설명 |
