@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxfixes3 \
         libopus0 \
         libvpx7 \
+        xclip \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

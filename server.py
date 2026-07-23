@@ -31,6 +31,17 @@ import mss
 import numpy as np
 import pyautogui
 from aiohttp import web
+
+try:
+    import pyperclip
+
+    # Probe once: on Linux, pyperclip needs a backend (xclip/xsel/wl-clipboard).
+    pyperclip.paste()
+    HAVE_CLIPBOARD = True
+except Exception as _clip_err:  # noqa: BLE001
+    pyperclip = None
+    HAVE_CLIPBOARD = False
+    print(f"[clipboard] disabled: {_clip_err}")
 from aiortc import (
     RTCConfiguration,
     RTCIceServer,
@@ -142,6 +153,27 @@ def apply_input(data: dict):
         print(f"[input] error handling {action}: {exc}")
 
 
+def get_clipboard() -> str:
+    """Return the host clipboard text (empty string if unavailable)."""
+    if not HAVE_CLIPBOARD:
+        return ""
+    try:
+        return pyperclip.paste() or ""
+    except Exception as exc:  # noqa: BLE001
+        print(f"[clipboard] read error: {exc}")
+        return ""
+
+
+def set_clipboard(text: str):
+    """Write text to the host clipboard."""
+    if not HAVE_CLIPBOARD:
+        return
+    try:
+        pyperclip.copy(str(text))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[clipboard] write error: {exc}")
+
+
 # --------------------------------------------------------------------------- #
 # ICE / TURN credentials
 # --------------------------------------------------------------------------- #
@@ -216,6 +248,7 @@ async def config(request):
         {
             "iceServers": build_ice(for_browser=True),
             "screen": {"w": SCREEN_W, "h": SCREEN_H},
+            "clipboard": HAVE_CLIPBOARD,
             # When TURN creds are time-limited, tell the client how long they last
             # so it can reconnect (re-fetch /config) before they expire.
             "turnTtl": CONFIG["turn_ttl"] if CONFIG["turn_secret"] else None,
@@ -251,8 +284,25 @@ async def offer(request):
                 data = json.loads(message)
             except (ValueError, TypeError):
                 return
-            # Run pyautogui off the event loop, in order.
-            loop.run_in_executor(INPUT_EXECUTOR, apply_input, data)
+            action = data.get("action")
+
+            if action == "clipboard_set":
+                loop.run_in_executor(
+                    INPUT_EXECUTOR, set_clipboard, data.get("text", "")
+                )
+            elif action == "clipboard_get":
+                # Read the host clipboard off the loop, then reply on the channel.
+                async def reply():
+                    text = await loop.run_in_executor(INPUT_EXECUTOR, get_clipboard)
+                    if channel.readyState == "open":
+                        channel.send(
+                            json.dumps({"type": "clipboard", "text": text})
+                        )
+
+                asyncio.ensure_future(reply())
+            else:
+                # Mouse/keyboard: run pyautogui off the event loop, in order.
+                loop.run_in_executor(INPUT_EXECUTOR, apply_input, data)
 
     # The browser offers a recvonly video transceiver + a data channel;
     # we attach the screen track as the answer.
@@ -346,6 +396,7 @@ def main():
     else:
         turn = "no (STUN only)"
     print(f"  TURN relay  : {turn}")
+    print(f"  Clipboard   : {'enabled' if HAVE_CLIPBOARD else 'disabled'}")
     print("=" * 60)
 
     web.run_app(app, host=args.host, port=args.port, print=None)

@@ -62,6 +62,8 @@
     <button class="btn-sm" data-hotkey="ctrl,c">Ctrl+C</button>
     <button class="btn-sm" data-hotkey="ctrl,v">Ctrl+V</button>
     <button class="btn-sm" data-key="esc">Esc</button>
+    <button class="btn-sm" id="clipPull" title="PC 클립보드를 이 기기로 가져오기" hidden>📋 PC→여기</button>
+    <button class="btn-sm" id="clipPush" title="이 기기 클립보드를 PC로 보내기" hidden>📋 여기→PC</button>
     <span id="status" class="small"></span>
   </div>
   <div id="screenWrap">
@@ -130,6 +132,20 @@ async function connect() {
     }
   };
 
+  // Messages from the PC (e.g. clipboard contents pulled on request).
+  dc.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (e) { return; }
+    if (msg.type === "clipboard") {
+      navigator.clipboard.writeText(msg.text || "").then(
+        () => setStatus("PC 클립보드를 가져왔습니다"),
+        () => setStatus("클립보드 쓰기 실패 (브라우저 권한 필요)")
+      );
+    }
+  };
+
+  clipboardEnabled = !!cfg.clipboard;
+
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
   await waitForIceGathering(pc);
@@ -148,6 +164,7 @@ async function connect() {
   $("login").style.display = "none";
   $("app").style.display = "flex";
   setupControls($("screen"));
+  setupClipboard();
 }
 
 // Wait until ICE candidates are gathered (or 3s elapse) so the offer we
@@ -163,10 +180,36 @@ function waitForIceGathering(pc) {
 }
 
 let rightClick = false;
+let clipboardEnabled = false;
 $("rightClickMode").onclick = () => {
   rightClick = !rightClick;
   $("rightClickMode").textContent = "우클릭: " + (rightClick ? "ON" : "OFF");
 };
+
+function setupClipboard() {
+  const pull = $("clipPull"), push = $("clipPush");
+  // Server must support clipboard AND the browser needs the async Clipboard API,
+  // which is only available in a secure context (HTTPS or localhost).
+  if (!clipboardEnabled || !navigator.clipboard) {
+    if (clipboardEnabled && !navigator.clipboard) {
+      setStatus("클립보드는 HTTPS(또는 localhost)에서만 동작합니다");
+    }
+    return;
+  }
+  pull.hidden = false;
+  push.hidden = false;
+
+  pull.onclick = () => send({ action: "clipboard_get" }); // reply arrives via dc.onmessage
+  push.onclick = async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      send({ action: "clipboard_set", text });
+      setStatus("이 기기 클립보드를 PC로 보냈습니다");
+    } catch (e) {
+      setStatus("클립보드 읽기 실패 (브라우저 권한 필요)");
+    }
+  };
+}
 
 function setupControls(video) {
   let dragging = false;
