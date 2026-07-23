@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>PC Remote Control</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #111; color: #eee;
+    font-family: system-ui, -apple-system, sans-serif;
+    height: 100vh; display: flex; flex-direction: column;
+  }
+  #login {
+    margin: auto; padding: 24px; background: #1c1c1c; border-radius: 12px;
+    display: flex; flex-direction: column; gap: 12px; width: min(90vw, 320px);
+  }
+  #login h1 { font-size: 18px; margin: 0 0 4px; }
+  input, button, select {
+    padding: 10px 12px; border-radius: 8px; border: 1px solid #333;
+    background: #262626; color: #eee; font-size: 15px;
+  }
+  button { cursor: pointer; background: #2d6cdf; border: none; }
+  button:hover { background: #3a78ea; }
+  #app { display: none; flex: 1; flex-direction: column; min-height: 0; }
+  #toolbar {
+    display: flex; gap: 8px; padding: 8px; background: #1a1a1a;
+    align-items: center; flex-wrap: wrap;
+  }
+  #toolbar input[type=text] { flex: 1; min-width: 120px; }
+  #screenWrap {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    overflow: hidden; background: #000; min-height: 0;
+  }
+  #screen {
+    max-width: 100%; max-height: 100%; touch-action: none;
+    cursor: crosshair; user-select: none; -webkit-user-select: none;
+  }
+  .small { font-size: 13px; color: #888; }
+  .btn-sm { padding: 8px 10px; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<div id="login">
+  <h1>PC Remote Control</h1>
+  <label class="small">접속 토큰을 입력하세요</label>
+  <input id="token" type="password" placeholder="access token" autocomplete="off" />
+  <button id="connectBtn">연결</button>
+  <div id="loginErr" class="small" style="color:#e06;"></div>
+</div>
+
+<div id="app">
+  <div id="toolbar">
+    <button class="btn-sm" id="rightClickMode">우클릭: OFF</button>
+    <input id="keyInput" type="text" placeholder="여기에 입력하면 PC로 전송 (Enter=엔터키)" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" />
+    <button class="btn-sm" data-key="enter">Enter</button>
+    <button class="btn-sm" data-key="backspace">⌫</button>
+    <button class="btn-sm" data-hotkey="ctrl,c">Ctrl+C</button>
+    <button class="btn-sm" data-hotkey="ctrl,v">Ctrl+V</button>
+    <button class="btn-sm" data-key="esc">Esc</button>
+    <span id="status" class="small"></span>
+  </div>
+  <div id="screenWrap">
+    <img id="screen" alt="remote screen" draggable="false" />
+  </div>
+</div>
+
+<script>
+let TOKEN = "";
+const $ = (id) => document.getElementById(id);
+
+function post(body) {
+  return fetch("/input", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...body, token: TOKEN }),
+  }).catch(() => {});
+}
+
+// Convert a pointer event on the <img> into normalized [0,1] coordinates
+// relative to the actual displayed image (accounting for letterboxing).
+function normCoords(ev, img) {
+  const r = img.getBoundingClientRect();
+  const cx = (ev.touches ? ev.touches[0].clientX : ev.clientX) - r.left;
+  const cy = (ev.touches ? ev.touches[0].clientY : ev.clientY) - r.top;
+  return { x: cx / r.width, y: cy / r.height };
+}
+
+$("connectBtn").onclick = async () => {
+  TOKEN = $("token").value.trim();
+  if (!TOKEN) return;
+  const res = await fetch("/info?token=" + encodeURIComponent(TOKEN));
+  if (!res.ok) {
+    $("loginErr").textContent = "토큰이 올바르지 않습니다.";
+    return;
+  }
+  $("login").style.display = "none";
+  $("app").style.display = "flex";
+  const img = $("screen");
+  img.src = "/stream?token=" + encodeURIComponent(TOKEN);
+  setupControls(img);
+};
+
+function setStatus(t) { $("status").textContent = t; }
+
+let rightClick = false;
+$("rightClickMode").onclick = () => {
+  rightClick = !rightClick;
+  $("rightClickMode").textContent = "우클릭: " + (rightClick ? "ON" : "OFF");
+};
+
+function setupControls(img) {
+  let dragging = false;
+
+  const down = (ev) => {
+    ev.preventDefault();
+    const c = normCoords(ev, img);
+    dragging = true;
+    post({ action: "mousedown", ...c, button: rightClick ? "right" : "left" });
+  };
+  const move = (ev) => {
+    if (!dragging && ev.type === "mousemove") {
+      // hover-move (desktop): keep cursor in sync without dragging
+      post({ action: "move", ...normCoords(ev, img) });
+      return;
+    }
+    if (dragging) {
+      ev.preventDefault();
+      post({ action: "move", ...normCoords(ev, img) });
+    }
+  };
+  const up = (ev) => {
+    if (!dragging) return;
+    ev.preventDefault();
+    const c = ev.changedTouches ? normCoords({ touches: ev.changedTouches }, img)
+                                : normCoords(ev, img);
+    dragging = false;
+    post({ action: "mouseup", ...c, button: rightClick ? "right" : "left" });
+  };
+
+  img.addEventListener("mousedown", down);
+  img.addEventListener("mousemove", move);
+  window.addEventListener("mouseup", up);
+  img.addEventListener("touchstart", down, { passive: false });
+  img.addEventListener("touchmove", move, { passive: false });
+  img.addEventListener("touchend", up, { passive: false });
+
+  img.addEventListener("wheel", (ev) => {
+    ev.preventDefault();
+    post({ action: "scroll", dy: ev.deltaY > 0 ? -1 : 1 });
+  }, { passive: false });
+
+  // suppress the browser context menu so right-drag works
+  img.addEventListener("contextmenu", (ev) => ev.preventDefault());
+
+  // --- keyboard ---
+  const ki = $("keyInput");
+  ki.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      const text = ki.value;
+      if (text) post({ action: "type", text });
+      post({ action: "key", key: "enter" });
+      ki.value = "";
+    } else if (ev.key === "Backspace" && ki.value === "") {
+      post({ action: "key", key: "backspace" });
+    }
+  });
+  ki.addEventListener("input", () => {
+    // send characters as they are typed, then clear the box
+    const text = ki.value;
+    if (text) { post({ action: "type", text }); ki.value = ""; }
+  });
+
+  document.querySelectorAll("[data-key]").forEach((b) => {
+    b.onclick = () => post({ action: "key", key: b.dataset.key });
+  });
+  document.querySelectorAll("[data-hotkey]").forEach((b) => {
+    b.onclick = () => post({ action: "key", keys: b.dataset.hotkey.split(",") });
+  });
+
+  img.onload = () => setStatus("연결됨");
+  img.onerror = () => setStatus("스트림 끊김 - 새로고침 하세요");
+}
+</script>
+</body>
+</html>
