@@ -9,3 +9,6 @@ env/
 # secrets (keep .env.example tracked)
 .env
 !.env.example
+
+# file-transfer shared folder
+remote_files/

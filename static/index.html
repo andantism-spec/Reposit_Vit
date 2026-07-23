@@ -41,6 +41,20 @@
   }
   .small { font-size: 13px; color: #888; }
   .btn-sm { padding: 8px 10px; font-size: 13px; }
+  #filePanel {
+    display: none; padding: 10px 12px; background: #161616;
+    border-bottom: 1px solid #262626; gap: 10px;
+    flex-direction: column; max-height: 45vh; overflow-y: auto;
+  }
+  #filePanel.open { display: flex; }
+  #filePanel .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  #fileList { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+  #fileList li {
+    display: flex; gap: 8px; align-items: center; justify-content: space-between;
+    padding: 6px 8px; background: #1f1f1f; border-radius: 6px;
+  }
+  #fileList .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #fileStatus { min-height: 18px; }
 </style>
 </head>
 <body>
@@ -64,7 +78,19 @@
     <button class="btn-sm" data-key="esc">Esc</button>
     <button class="btn-sm" id="clipPull" title="PC 클립보드를 이 기기로 가져오기" hidden>📋 PC→여기</button>
     <button class="btn-sm" id="clipPush" title="이 기기 클립보드를 PC로 보내기" hidden>📋 여기→PC</button>
+    <button class="btn-sm" id="fileToggle" title="파일 전송">📁 파일</button>
     <span id="status" class="small"></span>
+  </div>
+  <div id="filePanel">
+    <div class="row">
+      <label class="btn-sm" style="background:#2d6cdf;border-radius:8px;">
+        ⬆ PC로 업로드
+        <input id="fileInput" type="file" multiple hidden />
+      </label>
+      <button class="btn-sm" id="fileRefresh">↻ 공유 폴더 새로고침</button>
+      <span id="fileStatus" class="small"></span>
+    </div>
+    <ul id="fileList"></ul>
   </div>
   <div id="screenWrap">
     <video id="screen" autoplay playsinline muted></video>
@@ -123,6 +149,7 @@ async function connect() {
 
   pc.addTransceiver("video", { direction: "recvonly" });
   dc = pc.createDataChannel("input", { ordered: true });
+  dc.binaryType = "arraybuffer";  // receive file chunks as ArrayBuffer
 
   pc.ontrack = (ev) => { $("screen").srcObject = ev.streams[0]; };
   pc.onconnectionstatechange = () => {
@@ -132,15 +159,43 @@ async function connect() {
     }
   };
 
-  // Messages from the PC (e.g. clipboard contents pulled on request).
+  // Messages from the PC: clipboard replies, file listings, and download chunks.
   dc.onmessage = (ev) => {
+    // Binary => a chunk of the file currently being downloaded.
+    if (typeof ev.data !== "string") {
+      if (download) {
+        download.chunks.push(ev.data);
+        download.received += ev.data.byteLength;
+        setFileStatus(`다운로드 ${download.name}: ` +
+          Math.floor(download.received / Math.max(1, download.size) * 100) + "%");
+      }
+      return;
+    }
     let msg;
     try { msg = JSON.parse(ev.data); } catch (e) { return; }
-    if (msg.type === "clipboard") {
-      navigator.clipboard.writeText(msg.text || "").then(
-        () => setStatus("PC 클립보드를 가져왔습니다"),
-        () => setStatus("클립보드 쓰기 실패 (브라우저 권한 필요)")
-      );
+    switch (msg.type) {
+      case "clipboard":
+        navigator.clipboard.writeText(msg.text || "").then(
+          () => setStatus("PC 클립보드를 가져왔습니다"),
+          () => setStatus("클립보드 쓰기 실패 (브라우저 권한 필요)")
+        );
+        break;
+      case "file_list":
+        renderFileList(msg.files || []);
+        break;
+      case "download_begin":
+        download = { name: msg.name, size: msg.size, chunks: [], received: 0 };
+        break;
+      case "download_end":
+        if (download) { saveDownload(download); download = null; }
+        break;
+      case "upload_done":
+        setFileStatus(`PC에 저장됨: ${msg.name} (${fmtSize(msg.size)})`);
+        requestFileList();
+        break;
+      case "error":
+        setFileStatus("오류: " + msg.message);
+        break;
     }
   };
 
@@ -165,6 +220,7 @@ async function connect() {
   $("app").style.display = "flex";
   setupControls($("screen"));
   setupClipboard();
+  setupFiles();
 }
 
 // Wait until ICE candidates are gathered (or 3s elapse) so the offer we
@@ -209,6 +265,95 @@ function setupClipboard() {
       setStatus("클립보드 읽기 실패 (브라우저 권한 필요)");
     }
   };
+}
+
+// ---- file transfer ----------------------------------------------------------
+let download = null;                       // in-progress PC -> browser download
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const setFileStatus = (t) => { $("fileStatus").textContent = t; };
+
+function fmtSize(n) {
+  n = Number(n) || 0;
+  const u = ["B", "KB", "MB", "GB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i === 0 ? n : n.toFixed(1)) + u[i];
+}
+
+function setupFiles() {
+  $("fileToggle").onclick = () => {
+    const p = $("filePanel");
+    p.classList.toggle("open");
+    if (p.classList.contains("open")) requestFileList();
+  };
+  $("fileRefresh").onclick = requestFileList;
+  $("fileInput").onchange = (ev) => {
+    const files = Array.from(ev.target.files || []);
+    ev.target.value = "";           // allow re-selecting the same file later
+    (async () => { for (const f of files) await uploadFile(f); })();
+  };
+}
+
+function requestFileList() { send({ action: "file_list" }); }
+
+async function uploadFile(file) {
+  send({ action: "upload_begin", name: file.name, size: file.size });
+  const CHUNK = 16 * 1024;
+  let offset = 0;
+  while (offset < file.size) {
+    const buf = await file.slice(offset, offset + CHUNK).arrayBuffer();
+    // Back-pressure: don't outrun the data channel's send buffer.
+    while (dc.bufferedAmount > 8 * 1024 * 1024) await sleep(20);
+    if (dc.readyState !== "open") { setFileStatus("연결이 끊겨 업로드 중단"); return; }
+    dc.send(buf);
+    offset += buf.byteLength;
+    setFileStatus(`업로드 ${file.name}: ` +
+      Math.floor(offset / Math.max(1, file.size) * 100) + "%");
+  }
+  send({ action: "upload_end", name: file.name });
+}
+
+function requestDownload(name) {
+  setFileStatus(`다운로드 요청: ${name}`);
+  send({ action: "download", name });
+}
+
+function saveDownload(d) {
+  const blob = new Blob(d.chunks);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = d.name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+  setFileStatus(`다운로드 완료: ${d.name} (${fmtSize(d.size)})`);
+}
+
+function renderFileList(files) {
+  const ul = $("fileList");
+  ul.innerHTML = "";
+  if (!files.length) {
+    const li = document.createElement("li");
+    li.className = "small";
+    li.textContent = "공유 폴더가 비어 있습니다.";
+    ul.appendChild(li);
+    return;
+  }
+  for (const f of files) {
+    const li = document.createElement("li");
+    const label = document.createElement("span");
+    label.className = "name";
+    label.textContent = `${f.name}  ·  ${fmtSize(f.size)}`;
+    const btn = document.createElement("button");
+    btn.className = "btn-sm";
+    btn.textContent = "⬇ 받기";
+    btn.onclick = () => requestDownload(f.name);
+    li.appendChild(label);
+    li.appendChild(btn);
+    ul.appendChild(li);
+  }
 }
 
 function setupControls(video) {

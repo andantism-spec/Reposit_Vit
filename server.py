@@ -66,6 +66,7 @@ CONFIG = {
     "turn_pass": "",
     "turn_secret": "",     # time-limited credential mode (coturn use-auth-secret)
     "turn_ttl": 3600,
+    "files_dir": "",       # shared folder: uploads land here, downloads served from here
 }
 
 # Single worker keeps input events strictly ordered (down -> move -> up)
@@ -175,6 +176,80 @@ def set_clipboard(text: str):
 
 
 # --------------------------------------------------------------------------- #
+# File transfer (shared folder)
+# --------------------------------------------------------------------------- #
+FILE_CHUNK = 16 * 1024          # bytes per data-channel message
+FILE_BUFFER_LIMIT = 8 * 1024 * 1024  # pause download when channel buffer exceeds this
+
+
+def safe_name(name: str) -> str:
+    """Reduce a client-supplied name to a bare, traversal-safe filename."""
+    base = os.path.basename(str(name)).replace("\x00", "").strip()
+    return base or "unnamed"
+
+
+def is_within(directory: str, path: str) -> bool:
+    """True when `path` resolves inside `directory` (defends against traversal)."""
+    d = os.path.realpath(directory)
+    p = os.path.realpath(path)
+    return p == d or p.startswith(d + os.sep)
+
+
+def unique_path(path: str) -> str:
+    """Return `path`, or `name (n).ext` if it already exists, to avoid clobbering."""
+    if not os.path.exists(path):
+        return path
+    root, ext = os.path.splitext(path)
+    i = 1
+    while os.path.exists(f"{root} ({i}){ext}"):
+        i += 1
+    return f"{root} ({i}){ext}"
+
+
+def list_files():
+    """List regular files in the shared folder as [{name, size}, ...]."""
+    d = CONFIG["files_dir"]
+    out = []
+    try:
+        for n in sorted(os.listdir(d)):
+            p = os.path.join(d, n)
+            if os.path.isfile(p):
+                out.append({"name": n, "size": os.path.getsize(p)})
+    except Exception as exc:  # noqa: BLE001
+        print(f"[files] list error: {exc}")
+    return out
+
+
+async def stream_download(channel, send_json, name: str):
+    """Stream a shared-folder file to the browser as chunked binary messages."""
+    path = os.path.join(CONFIG["files_dir"], safe_name(name))
+    if not os.path.isfile(path) or not is_within(CONFIG["files_dir"], path):
+        send_json({"type": "error", "message": "파일을 찾을 수 없습니다"})
+        return
+
+    size = os.path.getsize(path)
+    send_json({"type": "download_begin", "name": os.path.basename(path), "size": size})
+    try:
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(FILE_CHUNK)
+                if not chunk:
+                    break
+                # Respect back-pressure so we don't blow up the send buffer.
+                while (
+                    channel.readyState == "open"
+                    and channel.bufferedAmount > FILE_BUFFER_LIMIT
+                ):
+                    await asyncio.sleep(0.05)
+                if channel.readyState != "open":
+                    return
+                channel.send(chunk)
+        send_json({"type": "download_end", "name": os.path.basename(path)})
+    except Exception as exc:  # noqa: BLE001
+        send_json({"type": "error", "message": f"다운로드 오류: {exc}"})
+
+
+# --------------------------------------------------------------------------- #
 # ICE / TURN credentials
 # --------------------------------------------------------------------------- #
 def make_turn_credentials():
@@ -249,6 +324,7 @@ async def config(request):
             "iceServers": build_ice(for_browser=True),
             "screen": {"w": SCREEN_W, "h": SCREEN_H},
             "clipboard": HAVE_CLIPBOARD,
+            "files": True,
             # When TURN creds are time-limited, tell the client how long they last
             # so it can reconnect (re-fetch /config) before they expire.
             "turnTtl": CONFIG["turn_ttl"] if CONFIG["turn_secret"] else None,
@@ -278,8 +354,37 @@ async def offer(request):
 
     @pc.on("datachannel")
     def on_datachannel(channel):
+        # Per-channel state for an in-progress browser -> PC upload. Data-channel
+        # messages are ordered, so a single "active upload" is sufficient: binary
+        # messages between upload_begin and upload_end belong to that file.
+        upload = {"f": None, "path": None, "received": 0}
+
+        def send_json(obj):
+            if channel.readyState == "open":
+                channel.send(json.dumps(obj))
+
+        def finish_upload():
+            if upload["f"] is not None:
+                try:
+                    upload["f"].close()
+                except Exception:  # noqa: BLE001
+                    pass
+                send_json({"type": "upload_done",
+                           "name": os.path.basename(upload["path"] or ""),
+                           "size": upload["received"]})
+            upload["f"] = None
+            upload["path"] = None
+            upload["received"] = 0
+
         @channel.on("message")
         def on_message(message):
+            # Binary payloads are file chunks for the active upload.
+            if isinstance(message, (bytes, bytearray)):
+                if upload["f"] is not None:
+                    upload["f"].write(message)
+                    upload["received"] += len(message)
+                return
+
             try:
                 data = json.loads(message)
             except (ValueError, TypeError):
@@ -300,6 +405,25 @@ async def offer(request):
                         )
 
                 asyncio.ensure_future(reply())
+            elif action == "upload_begin":
+                finish_upload()  # close any dangling transfer first
+                path = unique_path(
+                    os.path.join(CONFIG["files_dir"], safe_name(data.get("name")))
+                )
+                try:
+                    upload["f"] = open(path, "wb")
+                    upload["path"] = path
+                    upload["received"] = 0
+                except Exception as exc:  # noqa: BLE001
+                    send_json({"type": "error", "message": f"업로드 시작 실패: {exc}"})
+            elif action == "upload_end":
+                finish_upload()
+            elif action == "file_list":
+                send_json({"type": "file_list", "files": list_files()})
+            elif action == "download":
+                asyncio.ensure_future(
+                    stream_download(channel, send_json, data.get("name", ""))
+                )
             else:
                 # Mouse/keyboard: run pyautogui off the event loop, in order.
                 loop.run_in_executor(INPUT_EXECUTOR, apply_input, data)
@@ -366,6 +490,12 @@ def main():
         default=int(os.environ.get("TURN_TTL", "3600")),
         help="Lifetime in seconds of minted TURN credentials (default 3600).",
     )
+    parser.add_argument(
+        "--files-dir",
+        default=os.environ.get("FILES_DIR", "remote_files"),
+        help="Shared folder: browser uploads land here and downloads are "
+        "served from here (default ./remote_files).",
+    )
     args = parser.parse_args()
 
     CONFIG["token"] = args.token or secrets.token_urlsafe(12)
@@ -376,6 +506,8 @@ def main():
     CONFIG["turn_pass"] = args.turn_pass
     CONFIG["turn_secret"] = args.turn_secret
     CONFIG["turn_ttl"] = args.turn_ttl
+    CONFIG["files_dir"] = os.path.abspath(args.files_dir)
+    os.makedirs(CONFIG["files_dir"], exist_ok=True)
 
     app = web.Application()
     app.on_shutdown.append(on_shutdown)
@@ -397,6 +529,7 @@ def main():
         turn = "no (STUN only)"
     print(f"  TURN relay  : {turn}")
     print(f"  Clipboard   : {'enabled' if HAVE_CLIPBOARD else 'disabled'}")
+    print(f"  Files dir   : {CONFIG['files_dir']}")
     print("=" * 60)
 
     web.run_app(app, host=args.host, port=args.port, print=None)

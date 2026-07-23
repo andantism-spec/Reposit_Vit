@@ -33,9 +33,13 @@ services:
       # 방식 B(시간제한 자격증명 자동 발급) — TURN_SECRET만 채우면 됩니다.
       - TURN_SECRET=${TURN_SECRET:-}
       - TURN_TTL=${TURN_TTL:-3600}
+      # 파일 전송 공유 폴더 (컨테이너 내부 경로; 아래 볼륨으로 호스트와 공유)
+      - FILES_DIR=/data/files
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:ro
       - ${XAUTHORITY:-${HOME}/.Xauthority}:/root/.Xauthority:ro
+      # 업로드/다운로드 파일이 호스트의 ./remote_files 에 남도록 바인드 마운트
+      - ./remote_files:/data/files
     command: ["--host", "0.0.0.0", "--port", "8000", "--max-width", "1600"]
     restart: unless-stopped
 
