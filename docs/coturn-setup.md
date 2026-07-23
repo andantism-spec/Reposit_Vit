@@ -123,6 +123,9 @@ echo "username: $USER"
 echo "password: $PASS"
 ```
 
+> 이 프로젝트에서는 위 스크립트를 수동으로 돌릴 필요 없이, `server.py`에 `--turn-secret`만
+> 넘기면 서버가 접속 시점마다 동일한 규칙으로 임시 자격증명을 자동 발급합니다(§7 참고).
+
 ## 7. 이 프로젝트에 연결
 
 발급/설정한 값으로 `server.py`를 실행합니다.
@@ -141,12 +144,26 @@ python server.py --token my-secret \
   --turn-pass strongpassword
 ```
 
+```bash
+# 방식 B (시간제한 자격증명 자동 발급) — 권장
+# turnserver.conf 에서 use-auth-secret + static-auth-secret=<SECRET> 설정 후:
+python server.py --token my-secret \
+  --turn-url turn:turn.example.com:3478 \
+  --turn-secret <SECRET> \
+  --turn-ttl 3600
+```
+
+방식 B에서는 `--turn-user/--turn-pass`가 필요 없습니다. 서버가 `/config` 요청마다
+`username="<만료epoch>:webrtc"`, `password=base64(HMAC-SHA1(username, SECRET))` 규칙으로
+신선한 자격증명을 만들어 브라우저와 서버 양쪽 피어에 사용합니다. 자격증명이 유출되어도
+`--turn-ttl`(기본 3600초) 이후 자동 만료되므로 고정 계정보다 안전합니다.
+
 환경변수로도 지정할 수 있습니다:
 
 ```bash
 export TURN_URL=turn:turn.example.com:3478
-export TURN_USER=remoteuser
-export TURN_PASS=strongpassword
+export TURN_SECRET=your-static-auth-secret   # 방식 B
+# 또는 방식 A: export TURN_USER=... TURN_PASS=...
 python server.py --token my-secret
 ```
 

@@ -84,6 +84,21 @@ python server.py \
 
 환경변수 `TURN_URL`, `TURN_USER`, `TURN_PASS`로도 지정할 수 있습니다.
 
+**시간제한 자격증명 자동 발급(권장)**: coturn을 `use-auth-secret` 모드로 운영하면, 고정
+자격증명을 노출하는 대신 서버가 접속 시점마다 만료시각이 포함된 임시 자격증명을 발급합니다.
+`--turn-secret`(= coturn의 `static-auth-secret`)만 지정하면 됩니다.
+
+```bash
+python server.py --token my-secret \
+  --turn-url turn:turn.example.com:3478 \
+  --turn-secret <coturn-static-auth-secret> \
+  --turn-ttl 3600
+```
+
+이 경우 `/config`가 브라우저에 신선한 자격증명을 내려주며, 유출되어도 `--turn-ttl` 이후
+자동 만료됩니다. 발급 규칙은 `username="<만료epoch>:webrtc"`,
+`password=base64(HMAC-SHA1(username, secret))` (coturn REST 규약)입니다.
+
 TURN 서버를 직접 운영하려면 **[coturn 셋업 가이드](docs/coturn-setup.md)**를 참고하세요
 (설치·설정·인증·TLS·검증까지 정리되어 있습니다).
 
@@ -96,7 +111,10 @@ TURN 서버를 직접 운영하려면 **[coturn 셋업 가이드](docs/coturn-se
 | `--token` | 무작위 | 접속 토큰 (환경변수 `REMOTE_TOKEN`) |
 | `--max-width` | `0` | 프레임 최대 가로 폭(px). 0이면 원본 해상도 |
 | `--stun` | Google STUN | STUN URL. `none`으로 비활성화 |
-| `--turn-url` / `--turn-user` / `--turn-pass` | 없음 | TURN 릴레이 설정 |
+| `--turn-url` | 없음 | TURN 릴레이 URL (`turn:` 또는 `turns:`) |
+| `--turn-user` / `--turn-pass` | 없음 | 고정 자격증명 방식 (환경변수 `TURN_USER`/`TURN_PASS`) |
+| `--turn-secret` | 없음 | coturn `static-auth-secret`. 지정 시 서버가 **시간제한 자격증명을 자동 발급** (환경변수 `TURN_SECRET`) |
+| `--turn-ttl` | `3600` | 자동 발급 자격증명의 유효 시간(초) (환경변수 `TURN_TTL`) |
 
 ## 사용법 (웹 UI)
 

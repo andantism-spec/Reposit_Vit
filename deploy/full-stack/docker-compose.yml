@@ -27,8 +27,12 @@ services:
       - REMOTE_TOKEN=${REMOTE_TOKEN:?REMOTE_TOKEN을 .env에 설정하세요}
       # TURN을 쓸 경우 아래 값이 그대로 브라우저에도 전달됩니다.
       - TURN_URL=${TURN_URL:-}
+      # 방식 A(고정 계정)
       - TURN_USER=${TURN_USER:-}
       - TURN_PASS=${TURN_PASS:-}
+      # 방식 B(시간제한 자격증명 자동 발급) — TURN_SECRET만 채우면 됩니다.
+      - TURN_SECRET=${TURN_SECRET:-}
+      - TURN_TTL=${TURN_TTL:-3600}
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:ro
       - ${XAUTHORITY:-${HOME}/.Xauthority}:/root/.Xauthority:ro

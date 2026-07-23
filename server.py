@@ -18,9 +18,13 @@ themselves travel P2P (or via TURN), not through that tunnel.
 
 import argparse
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import os
 import secrets
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import mss
@@ -44,8 +48,13 @@ SCREEN_W, SCREEN_H = pyautogui.size()
 
 CONFIG = {
     "token": "",
-    "ice_servers": [],   # list of RTCIceServer for the server side
-    "ice_json": [],      # same, as plain dicts, for the browser
+    "max_width": 0,
+    "stun": "",
+    "turn_url": "",
+    "turn_user": "",       # static credential mode
+    "turn_pass": "",
+    "turn_secret": "",     # time-limited credential mode (coturn use-auth-secret)
+    "turn_ttl": 3600,
 }
 
 # Single worker keeps input events strictly ordered (down -> move -> up)
@@ -134,6 +143,56 @@ def apply_input(data: dict):
 
 
 # --------------------------------------------------------------------------- #
+# ICE / TURN credentials
+# --------------------------------------------------------------------------- #
+def make_turn_credentials():
+    """Mint a short-lived TURN username/password.
+
+    Follows coturn's ``use-auth-secret`` (REST) convention:
+        username = "<expiry-epoch>:<name>"
+        password = base64( HMAC-SHA1(username, static_auth_secret) )
+    The credential is valid until ``expiry`` and requires no per-user state on
+    the TURN server.
+    """
+    expiry = int(time.time()) + int(CONFIG["turn_ttl"])
+    username = f"{expiry}:webrtc"
+    digest = hmac.new(
+        CONFIG["turn_secret"].encode(), username.encode(), hashlib.sha1
+    ).digest()
+    password = base64.b64encode(digest).decode()
+    return username, password
+
+
+def build_ice(for_browser: bool):
+    """Assemble the ICE server list, minting fresh TURN creds when a secret is set.
+
+    Returns plain dicts for the browser (``/config``) or ``RTCIceServer``
+    objects for the server-side peer connection (``/offer``).
+    """
+    servers = []
+
+    def add(json_entry, **server_kwargs):
+        servers.append(json_entry if for_browser else RTCIceServer(**server_kwargs))
+
+    stun = CONFIG["stun"]
+    if stun and stun.lower() != "none":
+        add({"urls": [stun]}, urls=[stun])
+
+    if CONFIG["turn_url"]:
+        if CONFIG["turn_secret"]:
+            user, pwd = make_turn_credentials()
+        else:
+            user, pwd = CONFIG["turn_user"], CONFIG["turn_pass"]
+        if user and pwd:
+            add(
+                {"urls": [CONFIG["turn_url"]], "username": user, "credential": pwd},
+                urls=[CONFIG["turn_url"]], username=user, credential=pwd,
+            )
+
+    return servers
+
+
+# --------------------------------------------------------------------------- #
 # HTTP: static files, config, WebRTC signaling
 # --------------------------------------------------------------------------- #
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -154,7 +213,13 @@ async def config(request):
     if not token_ok(request):
         return web.json_response({"error": "unauthorized"}, status=401)
     return web.json_response(
-        {"iceServers": CONFIG["ice_json"], "screen": {"w": SCREEN_W, "h": SCREEN_H}}
+        {
+            "iceServers": build_ice(for_browser=True),
+            "screen": {"w": SCREEN_W, "h": SCREEN_H},
+            # When TURN creds are time-limited, tell the client how long they last
+            # so it can reconnect (re-fetch /config) before they expire.
+            "turnTtl": CONFIG["turn_ttl"] if CONFIG["turn_secret"] else None,
+        }
     )
 
 
@@ -166,7 +231,7 @@ async def offer(request):
     offer_desc = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
     pc = RTCPeerConnection(
-        configuration=RTCConfiguration(iceServers=CONFIG["ice_servers"])
+        configuration=RTCConfiguration(iceServers=build_ice(for_browser=False))
     )
     pcs.add(pc)
     loop = asyncio.get_event_loop()
@@ -208,34 +273,6 @@ async def on_shutdown(app):
 
 
 # --------------------------------------------------------------------------- #
-def build_ice(args):
-    servers = []
-    ice_json = []
-
-    stun = args.stun or "stun:stun.l.google.com:19302"
-    if stun.lower() != "none":
-        servers.append(RTCIceServer(urls=[stun]))
-        ice_json.append({"urls": [stun]})
-
-    if args.turn_url:
-        servers.append(
-            RTCIceServer(
-                urls=[args.turn_url],
-                username=args.turn_user,
-                credential=args.turn_pass,
-            )
-        )
-        ice_json.append(
-            {
-                "urls": [args.turn_url],
-                "username": args.turn_user,
-                "credential": args.turn_pass,
-            }
-        )
-
-    return servers, ice_json
-
-
 def main():
     parser = argparse.ArgumentParser(description="WebRTC PC remote control")
     parser.add_argument("--host", default="0.0.0.0")
@@ -257,13 +294,38 @@ def main():
         help="STUN URL (default Google STUN). Use 'none' to disable.",
     )
     parser.add_argument("--turn-url", default=os.environ.get("TURN_URL", ""))
-    parser.add_argument("--turn-user", default=os.environ.get("TURN_USER", ""))
-    parser.add_argument("--turn-pass", default=os.environ.get("TURN_PASS", ""))
+    parser.add_argument(
+        "--turn-user",
+        default=os.environ.get("TURN_USER", ""),
+        help="Static TURN username (ignored when --turn-secret is set).",
+    )
+    parser.add_argument(
+        "--turn-pass",
+        default=os.environ.get("TURN_PASS", ""),
+        help="Static TURN password (ignored when --turn-secret is set).",
+    )
+    parser.add_argument(
+        "--turn-secret",
+        default=os.environ.get("TURN_SECRET", ""),
+        help="coturn static-auth-secret. When set, the server mints "
+        "time-limited TURN credentials automatically (REST convention).",
+    )
+    parser.add_argument(
+        "--turn-ttl",
+        type=int,
+        default=int(os.environ.get("TURN_TTL", "3600")),
+        help="Lifetime in seconds of minted TURN credentials (default 3600).",
+    )
     args = parser.parse_args()
 
     CONFIG["token"] = args.token or secrets.token_urlsafe(12)
     CONFIG["max_width"] = args.max_width
-    CONFIG["ice_servers"], CONFIG["ice_json"] = build_ice(args)
+    CONFIG["stun"] = args.stun or "stun:stun.l.google.com:19302"
+    CONFIG["turn_url"] = args.turn_url
+    CONFIG["turn_user"] = args.turn_user
+    CONFIG["turn_pass"] = args.turn_pass
+    CONFIG["turn_secret"] = args.turn_secret
+    CONFIG["turn_ttl"] = args.turn_ttl
 
     app = web.Application()
     app.on_shutdown.append(on_shutdown)
@@ -277,7 +339,12 @@ def main():
     print(f"  Screen      : {SCREEN_W} x {SCREEN_H}")
     print(f"  Listening   : http://{args.host}:{args.port}/")
     print(f"  Access token: {CONFIG['token']}")
-    turn = "yes" if args.turn_url else "no (STUN only)"
+    if args.turn_url and args.turn_secret:
+        turn = f"yes (auto time-limited creds, ttl={args.turn_ttl}s)"
+    elif args.turn_url:
+        turn = "yes (static creds)"
+    else:
+        turn = "no (STUN only)"
     print(f"  TURN relay  : {turn}")
     print("=" * 60)
 
