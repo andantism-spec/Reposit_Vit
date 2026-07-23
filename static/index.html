@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
-<title>PC Remote Control</title>
+<title>PC Remote Control (WebRTC)</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -14,15 +14,16 @@
   }
   #login {
     margin: auto; padding: 24px; background: #1c1c1c; border-radius: 12px;
-    display: flex; flex-direction: column; gap: 12px; width: min(90vw, 320px);
+    display: flex; flex-direction: column; gap: 12px; width: min(90vw, 340px);
   }
   #login h1 { font-size: 18px; margin: 0 0 4px; }
-  input, button, select {
+  input, button {
     padding: 10px 12px; border-radius: 8px; border: 1px solid #333;
     background: #262626; color: #eee; font-size: 15px;
   }
   button { cursor: pointer; background: #2d6cdf; border: none; }
   button:hover { background: #3a78ea; }
+  button:disabled { opacity: .5; cursor: default; }
   #app { display: none; flex: 1; flex-direction: column; min-height: 0; }
   #toolbar {
     display: flex; gap: 8px; padding: 8px; background: #1a1a1a;
@@ -34,8 +35,9 @@
     overflow: hidden; background: #000; min-height: 0;
   }
   #screen {
-    max-width: 100%; max-height: 100%; touch-action: none;
-    cursor: crosshair; user-select: none; -webkit-user-select: none;
+    max-width: 100%; max-height: 100%; object-fit: contain;
+    touch-action: none; cursor: crosshair;
+    user-select: none; -webkit-user-select: none;
   }
   .small { font-size: 13px; color: #888; }
   .btn-sm { padding: 8px 10px; font-size: 13px; }
@@ -44,7 +46,7 @@
 <body>
 
 <div id="login">
-  <h1>PC Remote Control</h1>
+  <h1>PC Remote Control · WebRTC</h1>
   <label class="small">접속 토큰을 입력하세요</label>
   <input id="token" type="password" placeholder="access token" autocomplete="off" />
   <button id="connectBtn">연결</button>
@@ -63,47 +65,102 @@
     <span id="status" class="small"></span>
   </div>
   <div id="screenWrap">
-    <img id="screen" alt="remote screen" draggable="false" />
+    <video id="screen" autoplay playsinline muted></video>
   </div>
 </div>
 
 <script>
 let TOKEN = "";
+let pc = null;
+let dc = null;
 const $ = (id) => document.getElementById(id);
+const setStatus = (t) => { $("status").textContent = t; };
 
-function post(body) {
-  return fetch("/input", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ...body, token: TOKEN }),
-  }).catch(() => {});
+function send(obj) {
+  if (dc && dc.readyState === "open") {
+    try { dc.send(JSON.stringify(obj)); } catch (e) {}
+  }
 }
 
-// Convert a pointer event on the <img> into normalized [0,1] coordinates
-// relative to the actual displayed image (accounting for letterboxing).
-function normCoords(ev, img) {
-  const r = img.getBoundingClientRect();
-  const cx = (ev.touches ? ev.touches[0].clientX : ev.clientX) - r.left;
-  const cy = (ev.touches ? ev.touches[0].clientY : ev.clientY) - r.top;
-  return { x: cx / r.width, y: cy / r.height };
+// Map a pointer event on the <video> to normalized [0,1] coordinates,
+// accounting for the letterboxing produced by object-fit: contain.
+function normCoords(clientX, clientY, video) {
+  const r = video.getBoundingClientRect();
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return { x: 0, y: 0 };
+  const scale = Math.min(r.width / vw, r.height / vh);
+  const dispW = vw * scale, dispH = vh * scale;
+  const offX = (r.width - dispW) / 2, offY = (r.height - dispH) / 2;
+  const clamp = (v) => Math.min(Math.max(v, 0), 1);
+  return {
+    x: clamp((clientX - r.left - offX) / dispW),
+    y: clamp((clientY - r.top - offY) / dispH),
+  };
 }
 
-$("connectBtn").onclick = async () => {
+$("connectBtn").onclick = connect;
+
+async function connect() {
   TOKEN = $("token").value.trim();
   if (!TOKEN) return;
-  const res = await fetch("/info?token=" + encodeURIComponent(TOKEN));
-  if (!res.ok) {
-    $("loginErr").textContent = "토큰이 올바르지 않습니다.";
+  $("connectBtn").disabled = true;
+  $("loginErr").textContent = "";
+
+  let cfg;
+  try {
+    const res = await fetch("/config?token=" + encodeURIComponent(TOKEN));
+    if (!res.ok) throw new Error("auth");
+    cfg = await res.json();
+  } catch (e) {
+    $("loginErr").textContent = "토큰이 올바르지 않거나 서버에 연결할 수 없습니다.";
+    $("connectBtn").disabled = false;
     return;
   }
+
+  pc = new RTCPeerConnection({ iceServers: cfg.iceServers || [] });
+
+  pc.addTransceiver("video", { direction: "recvonly" });
+  dc = pc.createDataChannel("input", { ordered: true });
+
+  pc.ontrack = (ev) => { $("screen").srcObject = ev.streams[0]; };
+  pc.onconnectionstatechange = () => {
+    setStatus("상태: " + pc.connectionState);
+    if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
+      setStatus("연결 끊김 - 새로고침 후 다시 연결하세요");
+    }
+  };
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await waitForIceGathering(pc);
+
+  const answerRes = await fetch("/offer?token=" + encodeURIComponent(TOKEN), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sdp: pc.localDescription.sdp,
+      type: pc.localDescription.type,
+    }),
+  });
+  const answer = await answerRes.json();
+  await pc.setRemoteDescription(answer);
+
   $("login").style.display = "none";
   $("app").style.display = "flex";
-  const img = $("screen");
-  img.src = "/stream?token=" + encodeURIComponent(TOKEN);
-  setupControls(img);
-};
+  setupControls($("screen"));
+}
 
-function setStatus(t) { $("status").textContent = t; }
+// Wait until ICE candidates are gathered (or 3s elapse) so the offer we
+// POST already carries candidates — simpler than trickling them separately.
+function waitForIceGathering(pc) {
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => { pc.removeEventListener("icegatheringstatechange", check); resolve(); };
+    const check = () => { if (pc.iceGatheringState === "complete") done(); };
+    pc.addEventListener("icegatheringstatechange", check);
+    setTimeout(done, 3000);
+  });
+}
 
 let rightClick = false;
 $("rightClickMode").onclick = () => {
@@ -111,78 +168,70 @@ $("rightClickMode").onclick = () => {
   $("rightClickMode").textContent = "우클릭: " + (rightClick ? "ON" : "OFF");
 };
 
-function setupControls(img) {
+function setupControls(video) {
   let dragging = false;
+  const btn = () => (rightClick ? "right" : "left");
+
+  const getXY = (ev) => {
+    const t = ev.touches && ev.touches[0] ? ev.touches[0]
+            : ev.changedTouches && ev.changedTouches[0] ? ev.changedTouches[0] : ev;
+    return normCoords(t.clientX, t.clientY, video);
+  };
 
   const down = (ev) => {
     ev.preventDefault();
-    const c = normCoords(ev, img);
     dragging = true;
-    post({ action: "mousedown", ...c, button: rightClick ? "right" : "left" });
+    send({ action: "mousedown", ...getXY(ev), button: btn() });
   };
   const move = (ev) => {
-    if (!dragging && ev.type === "mousemove") {
-      // hover-move (desktop): keep cursor in sync without dragging
-      post({ action: "move", ...normCoords(ev, img) });
+    if (ev.type === "mousemove" && !dragging) {
+      send({ action: "move", ...getXY(ev) });
       return;
     }
-    if (dragging) {
-      ev.preventDefault();
-      post({ action: "move", ...normCoords(ev, img) });
-    }
+    if (dragging) { ev.preventDefault(); send({ action: "move", ...getXY(ev) }); }
   };
   const up = (ev) => {
     if (!dragging) return;
     ev.preventDefault();
-    const c = ev.changedTouches ? normCoords({ touches: ev.changedTouches }, img)
-                                : normCoords(ev, img);
     dragging = false;
-    post({ action: "mouseup", ...c, button: rightClick ? "right" : "left" });
+    send({ action: "mouseup", ...getXY(ev), button: btn() });
   };
 
-  img.addEventListener("mousedown", down);
-  img.addEventListener("mousemove", move);
+  video.addEventListener("mousedown", down);
+  video.addEventListener("mousemove", move);
   window.addEventListener("mouseup", up);
-  img.addEventListener("touchstart", down, { passive: false });
-  img.addEventListener("touchmove", move, { passive: false });
-  img.addEventListener("touchend", up, { passive: false });
+  video.addEventListener("touchstart", down, { passive: false });
+  video.addEventListener("touchmove", move, { passive: false });
+  video.addEventListener("touchend", up, { passive: false });
 
-  img.addEventListener("wheel", (ev) => {
+  video.addEventListener("wheel", (ev) => {
     ev.preventDefault();
-    post({ action: "scroll", dy: ev.deltaY > 0 ? -1 : 1 });
+    send({ action: "scroll", dy: ev.deltaY > 0 ? -1 : 1 });
   }, { passive: false });
 
-  // suppress the browser context menu so right-drag works
-  img.addEventListener("contextmenu", (ev) => ev.preventDefault());
+  video.addEventListener("contextmenu", (ev) => ev.preventDefault());
 
-  // --- keyboard ---
   const ki = $("keyInput");
   ki.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") {
       ev.preventDefault();
-      const text = ki.value;
-      if (text) post({ action: "type", text });
-      post({ action: "key", key: "enter" });
+      if (ki.value) send({ action: "type", text: ki.value });
+      send({ action: "key", key: "enter" });
       ki.value = "";
     } else if (ev.key === "Backspace" && ki.value === "") {
-      post({ action: "key", key: "backspace" });
+      send({ action: "key", key: "backspace" });
     }
   });
   ki.addEventListener("input", () => {
-    // send characters as they are typed, then clear the box
-    const text = ki.value;
-    if (text) { post({ action: "type", text }); ki.value = ""; }
+    if (ki.value) { send({ action: "type", text: ki.value }); ki.value = ""; }
   });
 
   document.querySelectorAll("[data-key]").forEach((b) => {
-    b.onclick = () => post({ action: "key", key: b.dataset.key });
+    b.onclick = () => send({ action: "key", key: b.dataset.key });
   });
   document.querySelectorAll("[data-hotkey]").forEach((b) => {
-    b.onclick = () => post({ action: "key", keys: b.dataset.hotkey.split(",") });
+    b.onclick = () => send({ action: "key", keys: b.dataset.hotkey.split(",") });
   });
-
-  img.onload = () => setStatus("연결됨");
-  img.onerror = () => setStatus("스트림 끊김 - 새로고침 하세요");
 }
 </script>
 </body>
