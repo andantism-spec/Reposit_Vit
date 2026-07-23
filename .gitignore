@@ -5,3 +5,7 @@ venv/
 env/
 *.log
 .DS_Store
+
+# secrets (keep .env.example tracked)
+.env
+!.env.example

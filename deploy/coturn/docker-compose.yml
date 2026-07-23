@@ -1,0 +1,25 @@
+# coturn TURN 서버 Docker 배포 예시
+#
+# 사용법:
+#   1) .env 파일을 만들어 아래 값을 채웁니다 (deploy/coturn/.env.example 참고)
+#   2) turnserver.conf에서 external-ip / realm / 자격증명을 자신의 값으로 수정
+#   3) docker compose up -d
+#
+# 주의: TURN은 넓은 UDP 릴레이 포트 범위가 필요해 host 네트워크 모드가 가장 확실합니다.
+#       (수천 개 포트를 -p로 매핑하는 것은 비현실적) host 모드는 Linux 호스트에서만
+#       동작하므로, 공인 IP를 가진 리눅스 서버에서 실행하세요.
+
+services:
+  coturn:
+    image: coturn/coturn:4.6
+    container_name: coturn
+    # 릴레이 포트 범위(49152-65535/udp)를 그대로 노출하기 위해 host 네트워크 사용
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+      # TLS(turns:)를 쓸 경우 인증서를 마운트하고 turnserver.conf에서 경로를 지정
+      # - /etc/letsencrypt/live/turn.example.com:/certs:ro
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+    # 로그를 stdout으로 보고 싶으면 turnserver.conf에서 log-file 대신 사용:
+    #   command: ["-c", "/etc/coturn/turnserver.conf", "--log-file=stdout", "--simple-log"]

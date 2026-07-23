@@ -173,6 +173,67 @@ python server.py --token my-secret
 | UDP 차단 네트워크 | `turns:`(TLS, 5349/443 TCP) 사용으로 우회 |
 | 서버 시각 오차 | 시간제한 자격증명은 서버 시계에 민감 → NTP 동기화 |
 
+## Docker로 배포하기
+
+apt 설치 대신 컨테이너로 운영하고 싶다면 이 저장소의 [`deploy/coturn/`](../deploy/coturn/)
+예시를 사용하세요.
+
+```
+deploy/coturn/
+├── docker-compose.yml   # coturn/coturn 이미지, host 네트워크
+├── turnserver.conf      # 마운트되는 설정 파일 (값만 수정)
+└── .env.example         # 채워야 할 값 메모
+```
+
+### 왜 host 네트워크 모드인가
+
+TURN은 릴레이용으로 넓은 UDP 포트 범위(`49152-65535`)를 사용합니다. 이 수천 개 포트를
+`-p`로 개별 매핑하는 것은 비현실적이라, 컨테이너를 호스트 네트워크에 직접 붙이는
+`network_mode: host`가 가장 확실합니다. 단, host 모드는 **리눅스 호스트에서만** 동작하므로
+공인 IP를 가진 리눅스 서버에서 실행하세요.
+
+### 실행 절차
+
+```bash
+cd deploy/coturn
+
+# 1) 설정값 수정: turnserver.conf의 <PUBLIC_IP>, <REALM>, <TURN_USER>, <TURN_PASS>를 교체
+#    (.env.example은 어떤 값을 채워야 하는지에 대한 메모입니다)
+cp .env.example .env      # 선택: 값을 메모해두는 용도
+
+# 2) 기동
+docker compose up -d
+
+# 3) 로그 확인 (turnserver.conf에서 log-file=stdout 사용 시)
+docker compose logs -f coturn
+```
+
+방화벽/보안그룹에서 `3478/udp`, `3478/tcp`, (TLS 시) `5349`, 그리고 `49152-65535/udp`를
+반드시 열어야 합니다.
+
+### TLS(turns:)를 쓸 경우
+
+호스트에서 certbot 등으로 발급한 인증서를 컨테이너로 마운트하고 `turnserver.conf`의
+`cert`/`pkey` 경로를 지정합니다. `docker-compose.yml`의 볼륨 주석을 참고하세요.
+
+```yaml
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - /etc/letsencrypt/live/turn.example.com:/certs:ro
+```
+
+```conf
+# turnserver.conf
+cert=/certs/fullchain.pem
+pkey=/certs/privkey.pem
+```
+
+### 검증
+
+apt 설치와 동일합니다. §8의 Trickle ICE 페이지에서 `typ relay` 후보가 나오는지 확인하고,
+연결이 안 되면 §9 문제 해결 표를 참고하세요. 컨테이너 로그는
+`docker compose logs -f coturn`으로 봅니다.
+
 ## 참고: 관리형 TURN
 
 직접 운영이 부담되면 관리형 TURN 서비스(예: Cloudflare Calls TURN, Twilio Network
